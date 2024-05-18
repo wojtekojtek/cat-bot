@@ -139,11 +139,11 @@ for e in CAT_TYPES:
     if e not in cattypes:
         cattypes.append(e)
 
-funny = ["why did you click this this arent yours", "absolutely not", "cat bot not responding, try again later", "you cant", "can you please stop", "try again", "403 not allowed", "stop", "get a life", "not for you", "no", "nuh uh"]
+funny = ["why did you click this this arent yours", "absolutely not", "cat bot not responding, try again later", "you cant", "can you please stop", "try again", "403 not allowed", "stop", "get a life", "not for you", "no", "nuh uh", "this won't make you more friends", "get a job",  ]
 
 summon_id = db["summon_ids"]
 
-milenakoos = 0
+milenakoos = 0Update main.py
 try:
     if not OWNER_ID:
         OWNER_ID = 0
