@@ -1,4 +1,4 @@
-import discord, msg2img, base64, sys, re, time, json, traceback, os, io, aiohttp, heapq, datetime, subprocess, asyncio, tarfile, server
+import discord, msg2img, base64, sys, re, time, json, traceback, os, io, aiohttp, heapq, datetime, subprocess, asyncio, tarfile, server, discord_emoji
 from discord.ext import tasks, commands
 from discord import ButtonStyle
 from discord.ui import Button, View
@@ -22,15 +22,20 @@ TOKEN = os.environ['token']
 # TOKEN = "token goes here"
 
 # top.gg voting key
-# you can set it to false ig
+# set to False to disable
 WEBHOOK_VERIFY = os.environ["webhook_verify"]
 
 # top.gg api token because they use ancient technology and you need to post server count manually smh
+# set to False to disable
 TOP_GG_TOKEN = os.environ["top_gg_token"]
 
 # this will automatically restart the bot if message in GITHUB_CHANNEL_ID is sent, you can use a github webhook for that
 # set to False to disable
 GITHUB_CHANNEL_ID = 1060965767044149249
+
+# all messages in this channel will be interpreted as user ids to give premium access to
+# set to False to disable
+DONOR_CHANNEL_ID = 1249343008890028144
 
 # whether you use pm2 for running it or not
 # that will just silently kill it on autoupdate and let pm2 restart it instead of manually restarting it
@@ -44,6 +49,9 @@ WHITELISTED_BOTS = [] # bots which are allowed to catch cats
 # if you dont know what that is or dont use it,
 # you can remove this line
 OWNER_ID = 553093932012011520
+
+# what to do when there is a crash
+CRASH_MODE = "RAISE"
 
 ### Setup values end
 
@@ -151,8 +159,6 @@ except Exception:
     OWNER_ID = 0
 
 save_queue = []
-terminate_queue = []
-update_queue = []
 
 # due to some stupid individuals spamming the hell out of reactions, we ratelimit them
 # you can do 50 reactions before they stop, limit resets on global cat loop
@@ -173,16 +179,22 @@ on_ready_debounce = False
 emojis = {}
 do_save_emojis = False
 
-# fire list controls whether to spawn the cat or skip to the next cycle
-# (this is done on /forcespawn to prevent too many spawns)
-fire = {}
-for i in summon_id:
-    fire[i] = True
+# for mentioning it in catch message, will be auto-fetched in on_ready()
+DONATE_ID = 1249368737824374896
 
 # this is a helper which saves id to its .json file
 def save(id):
     id = str(id)
-    save_queue.append(id)
+    if id not in save_queue:
+        save_queue.append(id)
+
+# migrate yet_to_spawn
+if isinstance(db["yet_to_spawn"], list):
+    saved_yet_to_spawn = db["yet_to_spawn"]
+    db["yet_to_spawn"] = {}
+    for i in saved_yet_to_spawn:
+        db["yet_to_spawn"][i] = 1
+    save("yet_to_spawn")
 
 # this is probably a good time to explain the database structure
 # each server is a json file
@@ -211,7 +223,7 @@ def remove_cat(server_id, person_id, cattype, val=1):
         result = db[str(server_id)][str(person_id)][cattype]
     except Exception:
         db[str(server_id)][str(person_id)][cattype] = 0
-        result = False
+        result = 0
     save(server_id)
     return result
 
@@ -342,95 +354,96 @@ async def achemb(message, ach_id, send_type, author_string=None):
             await asyncio.sleep(2)
             await result.edit(embed=embed)
 
+# function to autocomplete cat_type choices for /gift, /giftcat, and /forcespawn, which also allows more than 25 options
+async def cat_type_autocomplete(interaction: discord.Interaction, current: str) -> list[discord.app_commands.Choice[str]]:
+    return [discord.app_commands.Choice(name=choice, value=choice) for choice in cattypes if current.lower() in choice.lower()][:25]
 
-# if ch_id is None it runs the default loop for all servers
-# otherwise only for ch_id
-# this is used for custom cat spawn timings
-async def run_spawn(ch_id=None):
-    global bot, fire, save_queue, db, reactions_ratelimit
-    
-    if ch_id:
-        summon_id = [int(ch_id)]
-    else:
-        reactions_ratelimit = {}
-        # update status
-        await bot.change_presence(
-                activity=discord.CustomActivity(name=f"Catting in {len(bot.guilds):,} servers", emoji=discord.PartialEmoji.from_str(get_emoji("staring_cat")))
-        )
+# converts string to lowercase alphanumeric characters only
+def alnum(string):
+    return "".join(item for item in string.lower() if item.isalnum())
 
-        summon_id = db["summon_ids"]
-        print("Main cat loop is running")
-    
-    for i in summon_id:
-        try:
-            if fire[i] and not db["cat"][str(i)] and (ch_id or str(i) not in db["spawn_times"].keys()):
-                await asyncio.sleep(0.1)
-                file = discord.File("cat.png")
-                localcat = choice(CAT_TYPES)
-                icon = get_emoji(localcat.lower() + "cat")
-                channeley = bot.get_channel(int(i))
-                try:
-                    if db[str(channeley.guild.id)]["appear"]:
-                        appearstring = db[str(channeley.guild.id)]["appear"]
-                    else:
-                        appearstring = "{emoji} {type} cat has appeared! Type \"cat\" to catch it!"
-                except Exception as e:
-                    db[str(channeley.guild.id)]["appear"] = ""
-                    appearstring = "{emoji} {type} cat has appeared! Type \"cat\" to catch it!"
-                
-                message_is_sus = await channeley.send(appearstring.format(emoji=str(icon), type=localcat), file=file)
-                db["cat"][str(i)] = message_is_sus.id
-        except discord.NotFound:
-            summon_id.remove(i)
-        except discord.Forbidden:
-            summon_id.remove(i)
-        except Exception:
-            pass
-        fire[i] = True
-    
-    save("cat")
-    
-    if not ch_id:
-        db["summon_ids"] = list(set(summon_id)) # remove all duplicates
-        save("summon_ids")
-        print("Finished cat loop")
+# function to autocomplete achievement choice for /giveachievement, which also allows more than 25 options
+async def ach_autocomplete(interaction: discord.Interaction, current: str) -> list[discord.app_commands.Choice[str]]:
+    return [discord.app_commands.Choice(name=val, value=val) for (key, val) in ach_list.items() if (alnum(current) in alnum(key) or alnum(current) in alphanumeric(val))][:25]
 
-        for id in set(save_queue):
-            with open(f"data/{id}.json", "w") as f:
-                json.dump(db[id], f)
-    
-        save_queue = []
-    
-        # backup
-        with tarfile.open("backup.tar.gz", "w:gz") as tar:
-            tar.add("data", arcname=os.path.sep)
-        
-        backupchannel = await bot.fetch_channel(BACKUP_ID)
-        thing = discord.File("backup.tar.gz", filename="backup.tar.gz")
-        await backupchannel.send(f"In {len(bot.guilds)} servers.", file=thing)
-
-        vote_remind = db["vote_remind"]
-
-        # THIS IS CONSENTUAL AND TURNED OFF BY DEFAULT DONT BAN ME
-        for i in vote_remind:
-            if get_cat(0, i, "vote_time_topgg") + 43200 < time.time() and not get_cat(0, i, "reminder_topgg_exists"):
-                try:
-                    person = await bot.fetch_user(i)
-                    
-                    view = View(timeout=1)
-                    button = Button(emoji=get_emoji("topgg"), label="Vote", style=ButtonStyle.gray, url="https://top.gg/bot/966695034340663367/vote")
-                    view.add_item(button)
-                    
-                    await person.send("You can vote on Top.gg now!", view=view)
-                    set_cat(0, i, "reminder_topgg_exists", int(time.time()))
-                except Exception:
-                    vote_remind.remove(i)
-
-        db["vote_remind"] = vote_remind
-        save("vote_remind")
-        
-        if not TOP_GG_TOKEN:
+async def spawn_cat(ch_id, localcat=None):
+    try:
+        if db["cat"][ch_id]:
             return
+        
+        file = discord.File("cat.png")
+        
+        if not localcat:
+            localcat = choice(CAT_TYPES)
+        icon = get_emoji(localcat.lower() + "cat")
+        channeley = bot.get_channel(int(ch_id))
+        
+        try:
+            if db[str(channeley.guild.id)]["appear"]:
+                appearstring = db[str(channeley.guild.id)]["appear"]
+            else:
+                appearstring = "{emoji} {type} cat has appeared! Type \"cat\" to catch it!"
+        except Exception as e:
+            db[str(channeley.guild.id)]["appear"] = ""
+            appearstring = "{emoji} {type} cat has appeared! Type \"cat\" to catch it!"
+        
+        message_is_sus = await channeley.send(appearstring.replace("{emoji}", str(icon)).replace("{type}", localcat), file=file)
+        db["cat"][ch_id] = message_is_sus.id
+        save("cat")
+    except Exception:
+        pass
+    finally:
+        db["yet_to_spawn"][ch_id] = 0
+        save("yet_to_spawn")
+
+# a loop for various maintaince which is ran every 5 minutes
+@tasks.loop(minutes=5.0)
+async def maintaince_loop():
+    global save_queue, reactions_ratelimit
+    reactions_ratelimit = {}
+    today = datetime.date.today()
+    future = datetime.date(2024, 7, 8)
+    diff = future - today
+    await bot.change_presence(
+        activity=discord.CustomActivity(name=f"{diff.days} days left. In {len(bot.guilds):,} servers")
+    )
+
+    for id in set(save_queue):
+        with open(f"data/{id}.json", "w") as f:
+            json.dump(db[id], f)
+
+    save_queue = []
+
+    # backup
+    with tarfile.open("backup.tar.gz", "w:gz") as tar:
+        tar.add("data", arcname=os.path.sep)
+    
+    backupchannel = await bot.fetch_channel(BACKUP_ID)
+    thing = discord.File("backup.tar.gz", filename="backup.tar.gz")
+    await backupchannel.send(f"In {len(bot.guilds)} servers.", file=thing)
+
+    vote_remind = db["vote_remind"]
+
+    # THIS IS CONSENTUAL AND TURNED OFF BY DEFAULT DONT BAN ME
+    for i in vote_remind:
+        if get_cat(0, i, "vote_time_topgg") + 43200 < time.time() and not get_cat(0, i, "reminder_topgg_exists"):
+            await asyncio.sleep(0.1)
+            try:
+                person = bot.get_user(i)
+                
+                view = View(timeout=1)
+                button = Button(emoji=get_emoji("topgg"), label="Vote", style=ButtonStyle.gray, url="https://top.gg/bot/966695034340663367/vote")
+                view.add_item(button)
+                
+                await person.send("You can vote on Top.gg now!", view=view)
+                set_cat(0, i, "reminder_topgg_exists", int(time.time()))
+            except Exception:
+                vote_remind.remove(i)
+
+    db["vote_remind"] = vote_remind
+    save("vote_remind")
+    
+    if TOP_GG_TOKEN:
         async with aiohttp.ClientSession() as session:
             # send server count to top.gg
             try:
@@ -441,54 +454,25 @@ async def run_spawn(ch_id=None):
             except Exception:
                 print("Posting failed.")
 
+    yet_to_spawn_copy = db["yet_to_spawn"].copy()
+    for ch_id, ch_timer in yet_to_spawn_copy.items():
+        if ch_timer and time.time() > ch_timer and (ch_id not in db["cat"].keys() or not db["cat"][ch_id]):
+            await spawn_cat(ch_id)
+            await asyncio.sleep(0.1)
 
-# main spawn waiting loop
-# again, if ch_id is None its for basic spawns
-# otherwise for custom timings
-async def spawning_loop(times, ch_id):
-    global terminate_queue, update_queue
-    print("opened a loop for", ch_id)
-    can_recover = True # we only recover the first time the loop is ran
-    while True:
-        try:
-            if can_recover and db["recovery_times"][str(ch_id)] > time.time():
-                # recover
-                wait_time = db["recovery_times"][str(ch_id)] - time.time()
-                print("recovered", ch_id, "looping in", wait_time)
-            else:
-                raise Exception
-        except Exception:
-            wait_time = randint(times[0], times[1])
-            db["recovery_times"][str(ch_id)] = time.time() + wait_time
-            save("recovery_times")
-
-        can_recover = False
-
-        await asyncio.sleep(wait_time)
-
-        if str(ch_id) in terminate_queue:
-            print("terminating", ch_id)
-            terminate_queue.remove(str(ch_id))
-            return
-        if str(ch_id) in update_queue:
-            print("updating", ch_id)
-            update_queue.remove(str(ch_id))
-            times = db["spawn_times"][ch_id]
-
-        try:
-            await run_spawn(ch_id)
-        except Exception as e:
-            print(e)
 
 # some code which is run when bot is started
 @bot.event
 async def on_ready():
-    global milenakoos, OWNER_ID, do_save_emojis, save_queue, on_ready_debounce, gen_credits
+    global milenakoos, OWNER_ID, do_save_emojis, save_queue, on_ready_debounce, gen_credits, DONATE_ID
     if on_ready_debounce:
         return
     on_ready_debounce = True
     print("cat is now online")
-    await bot.tree.sync()
+    app_commands = await bot.tree.sync()
+    for i in app_commands:
+        if i.name == "donate":
+            DONATE_ID = i.id
     do_save_emojis = True
     await bot.change_presence(
         activity=discord.CustomActivity(name=f"Just restarted! Catting in {len(bot.guilds):,} servers.")
@@ -513,7 +497,7 @@ async def on_ready():
 
     credits = {
         "author": [553093932012011520],
-        "contrib": [576065759185338371, 819980535639572500, 432966085025857536, 646401965596868628, 696806601771974707],
+        "contrib": [576065759185338371, 819980535639572500, 432966085025857536, 646401965596868628, 696806601771974707, 804762486946660353, 931342092121280543, 695359046928171118],
         "tester": [712639066373619754, 902862104971849769, 709374062237057074, 520293520418930690, 689345298686148732, 1004128541853618197, 839458185059500032],
         "emoji": [709374062237057074],
         "trash": [520293520418930690]
@@ -532,18 +516,14 @@ async def on_ready():
             pass # death
         gen_credits[key] = ", ".join(peoples)
 
-    # we create all spawning loops
-    for k, v in db["spawn_times"].items():
-        bot.loop.create_task(spawning_loop(v, k))
-
-    bot.loop.create_task(spawning_loop([120, 1200], None))
+    maintaince_loop.start()
 
 
 # this is all the code which is ran on every message sent
 # its mostly for easter eggs or achievements
 @bot.event
 async def on_message(message):
-    global fire, save_queue
+    global save_queue
     text = message.content
     if message.author.id == bot.user.id:
         return
@@ -584,6 +564,10 @@ async def on_message(message):
             sys.exit()
         else:
             os.execv(sys.executable, ['python'] + sys.argv)
+
+    if DONOR_CHANNEL_ID and message.channel.id == DONOR_CHANNEL_ID:
+        register_member("0", text)
+        set_cat("0", text, "premium", 1)
 
     # :staring_cat: reaction on "bullshit"
     if not (" " in text) and len(text) > 7 and text.isalnum():
@@ -645,11 +629,11 @@ async def on_message(message):
             await achemb(message, ach[2], "reply")
             
     for r in reactions:
-        if r[0] in text.lower() and reactions_ratelimit.get(message.author.id, 0) < 50:
+        if r[0] in text.lower() and reactions_ratelimit.get(message.author.id, 0) < 20:
             if r[1] == "custom": em = get_emoji(r[2])
             elif r[1] == "vanilla": em = r[2]
-            reactions_ratelimit[message.author.id] = reactions_ratelimit.get(message.author.id, 0) + 1
             await message.add_reaction(em)
+            reactions_ratelimit[message.author.id] = reactions_ratelimit.get(message.author.id, 0) + 1
             
     for resp in responses:
         if (resp[1] == "startswith" and text.lower().startswith(resp[0])) or \
@@ -664,8 +648,7 @@ async def on_message(message):
     if text.lower() in ["ach", "cat!ach"]: await achemb(message, "test_ach", "reply")
     
     if text.lower() == "please do not the cat":
-        await message.reply(f"ok then\n{message.author.name} lost 1 fine cat!!!1!")
-        remove_cat(message.guild.id, message.author.id, "Fine")
+        await message.reply(f"ok then\n{message.author.name} lost 1 fine cat!!!1!\nYou now have {str(remove_cat(message.guild.id, message.author.id, "Fine"))} cats of dat type!")
         await achemb(message, "pleasedonotthecat", "reply")
     
     if text.lower() == "please do the cat":
@@ -681,6 +664,16 @@ async def on_message(message):
         file = discord.File("cart.png", filename="cart.png")
         embed = discord.Embed(title="cart!", color=0x6E593C).set_image(url="attachment://cart.png")
         await message.reply(file=file, embed=embed)
+
+    try:
+        catchmsg = await message.channel.fetch_message(db["cat"][str(message.channel.id)])
+        if get_emoji("suscat") in catchmsg.content:
+            for i in ["sus", "amogus", "among", "vent", "report"]:
+                if i in text.lower():
+                    await achemb(message, "sussy", "send")
+                    break
+    except Exception:
+        pass
 
     # this is run whether someone says "cat" (very complex)
     if text.lower() == "cat":
@@ -699,189 +692,233 @@ async def on_message(message):
             icon = get_emoji("pointlaugh")
             await message.add_reaction(icon)
         elif is_cat:
-            current_time = message.created_at.timestamp()
-            db["lastcatches"][str(message.channel.id)] = current_time
-            cat_temp = db["cat"][str(message.channel.id)]
-            db["cat"][str(message.channel.id)] = False
-            save("cat")
-            save("lastcatches")
             try:
-                await message.delete()
-            except discord.errors.Forbidden:
-                await message.channel.send("I don't have permission to delete messages. Please re-invite the bot or manually add that permission.")
+                times = db["spawn_times"][str(message.channel.id)]
+            except KeyError:
+                times = [120, 1200]
+            decided_time = randint(times[0], times[1])
+            db["yet_to_spawn"][str(message.channel.id)] = int(time.time()) + decided_time + 3
+            save("yet_to_spawn")
             try:
-                var = await message.channel.fetch_message(cat_temp)
-            except Exception:
-                await message.channel.send(f"oopsie poopsie i cant access the original message but {message.author.mention} *did* catch a cat rn")
-                return
-            catchtime = var.created_at
-            catchcontents = var.content
-            await var.delete()
-            try:
-                # some math to make time look cool
-                then = catchtime.timestamp()
-                time_caught = abs(round(((current_time - then) * 100)) / 100) # cry about it
-                days = time_caught // 86400
-                time_left = time_caught - (days * 86400)
-                hours = time_left // 3600
-                time_left = time_left - (hours * 3600)
-                minutes = time_left // 60
-                seconds = time_left - (minutes * 60)
-                caught_time = ""
-                if days:
-                    caught_time = caught_time + str(int(days)) + " days "
-                if hours:
-                    caught_time = caught_time + str(int(hours)) + " hours "
-                if minutes:
-                    caught_time = caught_time + str(int(minutes)) + " minutes "
-                if seconds:
-                    acc_seconds = round(seconds * 100) / 100
-                    caught_time = caught_time + str(acc_seconds) + " seconds "
-                do_time = True
-                if time_caught <= 0:
+                current_time = message.created_at.timestamp()
+                db["lastcatches"][str(message.channel.id)] = current_time
+                cat_temp = db["cat"][str(message.channel.id)]
+                db["cat"][str(message.channel.id)] = False
+                save("cat")
+                save("lastcatches")
+                try:
+                    await message.delete()
+                except discord.errors.Forbidden:
+                    await message.channel.send("I don't have permission to delete messages. Please re-invite the bot or manually add that permission.")
+                try:
+                    var = await message.channel.fetch_message(cat_temp)
+                except Exception:
+                    await message.channel.send(f"oopsie poopsie i cant access the original message but {message.author.mention} *did* catch a cat rn")
+                    return
+                catchtime = var.created_at
+                catchcontents = var.content
+                await var.delete()
+                try:
+                    # some math to make time look cool
+                    then = catchtime.timestamp()
+                    time_caught = abs(round(((current_time - then) * 100)) / 100) # cry about it
+                    days = time_caught // 86400
+                    time_left = time_caught - (days * 86400)
+                    hours = time_left // 3600
+                    time_left = time_left - (hours * 3600)
+                    minutes = time_left // 60
+                    seconds = time_left - (minutes * 60)
+                    caught_time = ""
+                    if days:
+                        caught_time = caught_time + str(int(days)) + " days "
+                    if hours:
+                        caught_time = caught_time + str(int(hours)) + " hours "
+                    if minutes:
+                        caught_time = caught_time + str(int(minutes)) + " minutes "
+                    if seconds:
+                        acc_seconds = round(seconds * 100) / 100
+                        caught_time = caught_time + str(acc_seconds) + " seconds "
+                    do_time = True
+                    if time_caught <= 0:
+                        do_time = False
+                except Exception as e:
+                    # if some of the above explodes just give up
+                    print(e)
                     do_time = False
-            except Exception as e:
-                # if some of the above explodes just give up
-                print(e)
-                do_time = False
-                caught_time = "undefined amounts of time "
+                    caught_time = "undefined amounts of time "
+    
+                icon = None
+                partial_type = None
+                for v in allowedemojis:
+                    if v in catchcontents:
+                        partial_type = v
+                        break
+    
+                if not partial_type: return
+    
+                for i in type_dict.keys():
+                    if i.lower() in partial_type:
+                        le_emoji = i
+                        break
+                    
+                icon = get_emoji(partial_type)
+    
+                try:
+                    if db[str(message.guild.id)]["cought"]:
+                        pass
+                except Exception:
+                    db[str(message.guild.id)]["cought"] = ""
+    
+                suffix_string = ""
+                silly_amount = 1
+                if get_cat(message.guild.id, message.author.id, "cataine_active") > time.time():
+                    # cataine is active
+                    silly_amount = 2
+                    suffix_string = f"\n🧂 cataine worked! you got 2 cats instead!"
+                    
+                elif get_cat(message.guild.id, message.author.id, "cataine_active") != 0:
+                    # cataine ran out
+                    add_cat(message.guild.id, message.author.id, "cataine_active", 0, True)
+                    suffix_string = f"\nyour cataine buff has expired. you know where to get a new one 😏"
 
-            icon = None
-            for v in allowedemojis:
-                if v in catchcontents:
-                    partial_type = v
-                    break
-
-            for i in type_dict.keys():
-                if i.lower() in partial_type:
-                    le_emoji = i
-                    break
-
-            if not le_emoji: return
+                elif randint(0, 7) == 0:
+                    # shill donating
+                    add_cat(message.guild.id, message.author.id, "cataine_active", 0, True)
+                    suffix_string += f"\n👑 donate to cat bot and get cool perks: </donate:{DONATE_ID}>"
                 
-            icon = get_emoji(partial_type)
-
-            try:
                 if db[str(message.guild.id)]["cought"]:
-                    pass
-            except Exception:
-                db[str(message.guild.id)]["cought"] = ""
-
-            suffix_string = ""
-            silly_amount = 1
-            if get_cat(message.guild.id, message.author.id, "cataine_active") > time.time():
-                # cataine is active
-                silly_amount = 2
-                suffix_string = f"\n🧂 cataine worked! you got 2 cats instead!"
+                    coughstring = db[str(message.guild.id)]["cought"]
+                elif le_emoji == "Corrupt":
+                    coughstring = "{username} coought{type} c{emoji}at!!!!404!\nYou now BEEP {count} cats of dCORRUPTED!!\nthis fella wa- {time}!!!!"
+                elif le_emoji == "eGirl":
+                    coughstring = "{username} cowought {emoji} {type} cat~~ ^^\nYou-u now *blushes* hawe {count} cats of dat tywe~!!!\nthis fella was <3 cought in {time}!!!!"
+                elif le_emoji == "Rickroll":
+                    coughstring = "{username} cought {emoji} {type} cat!!!!1!\nYou will never give up {count} cats of dat type!!!\nYou wouldn't let them down even after {time}!!!!"
+                elif le_emoji == "Sus":
+                    coughstring = "{username} cought {emoji} {type} cat!!!!1!\nYou have vented infront of {count} cats of dat type!!!\nthis sussy baka was cought in {time}!!!!"
+                elif le_emoji == "Professor":
+                    coughstring = "{username} caught {emoji} {type} cat!\nThou now hast {count} cats of that type!\nThis fellow was caught 'i {time}!"
+                elif le_emoji == "8bit":
+                    coughstring = "{username} c0ught {emoji} {type} cat!!!!1!\nY0u n0w h0ve {count} cats 0f dat type!!!\nth1s fe11a was c0ught 1n {time}!!!!"
+                elif le_emoji == "Reverse":
+                    coughstring = "!!!!{time} in cought was fella this\n!!!type dat of cats {count} have now You\n!1!!!!cat {type} {emoji} cought {username}"
+                else:
+                    coughstring = "{username} cought {emoji} {type} cat!!!!1!\nYou now have {count} cats of dat type!!!\nthis fella was cought in {time}!!!!"
+                view = None
+                button = None
+    
+                async def dark_market_cutscene(interaction):
+                    nonlocal message
+                    if interaction.user != message.author:
+                        await interaction.response.send_message("the shadow you saw runs away. perhaps you need to be the one to catch the cat.", ephemeral=True)
+                        return
+                    if get_cat(message.guild.id, message.author.id, "dark_market") != 0:
+                        await interaction.response.send_message("the shadowy figure is nowhere to be found.", ephemeral=True)
+                        return
+                    add_cat(message.guild.id, message.author.id, "dark_market", 1, True)
+                    await interaction.response.send_message("is someone watching after you?", ephemeral=True)
+                    await asyncio.sleep(5)
+                    await interaction.followup.send("you walk up to them. the dark voice says:", ephemeral=True)
+                    await asyncio.sleep(5)
+                    await interaction.followup.send("**???**: Hello. We have a unique deal for you.", ephemeral=True)
+                    await asyncio.sleep(5)
+                    await interaction.followup.send("**???**: To access our services, press \"Hidden\" `/achievements` tab 3 times in a row.", ephemeral=True)
+                    await asyncio.sleep(5)
+                    await interaction.followup.send("**???**: You won't be disappointed.", ephemeral=True)
+                    await asyncio.sleep(5)
+                    await interaction.followup.send("before you manage to process that, the figure disappears. will you figure out whats going on?", ephemeral=True)
+                    await asyncio.sleep(5)
+                    await interaction.followup.send("the only choice is to go to that place.", ephemeral=True)
                 
-            elif get_cat(message.guild.id, message.author.id, "cataine_active") != 0:
-                # cataine ran out
-                add_cat(message.guild.id, message.author.id, "cataine_active", 0, True)
-                suffix_string = f"\nyour cataine buff has expired. you know where to get a new one 😏"
-            
-            if db[str(message.guild.id)]["cought"]:
-                coughstring = db[str(message.guild.id)]["cought"]
-            elif le_emoji == "Corrupt":
-                coughstring = "{username} coought{type} c{emoji}at!!!!404!\nYou now BEEP {count} cats of dCORRUPTED!!\nthis fella wa- {time}!!!!"
-            elif le_emoji == "eGirl":
-                coughstring = "{username} cowought {emoji} {type} cat~~ ^^\nYou-u now *blushes* hawe {count} cats of dat tywe~!!!\nthis fella was <3 cought in {time}!!!!"
-            elif le_emoji == "Rickroll":
-                coughstring = "{username} cought {emoji} {type} cat!!!!1!\nYou will never give up {count} cats of dat type!!!\nYou wouldn't let them down even after {time}!!!!"
-            elif le_emoji == "Sus":
-                coughstring = "{username} cought {emoji} {type} cat!!!!1!\nYou have vented infront of {count} cats of dat type!!!\nthis sussy baka was cought in {time}!!!!"
-            elif le_emoji == "Professor":
-                coughstring = "{username} caught {emoji} {type} cat!\nThou now hast {count} cats of that type!\nThis fellow was caught 'i {time}!"
-            elif le_emoji == "8bit":
-                coughstring = "{username} c0ught {emoji} {type} cat!!!!1!\nY0u n0w h0ve {count} cats 0f dat type!!!\nth1s fe11a was c0ught 1n {time}!!!!"
-            elif le_emoji == "Reverse":
-                coughstring = "!!!!{time} in cought was fella this\n!!!type dat of cats {count} have now You\n!1!!!!cat {type} {emoji} cought {username}"
-            else:
-                coughstring = "{username} cought {emoji} {type} cat!!!!1!\nYou now have {count} cats of dat type!!!\nthis fella was cought in {time}!!!!"
-            view = None
-            button = None
-
-            async def dark_market_cutscene(interaction):
-                nonlocal message
-                if interaction.user != message.author:
-                    await interaction.response.send_message("the shadow you saw runs away. perhaps you need to be the one to catch the cat.", ephemeral=True)
-                    return
-                if get_cat(message.guild.id, message.author.id, "dark_market") != 0:
-                    await interaction.response.send_message("the shadowy figure is nowhere to be found.", ephemeral=True)
-                    return
-                add_cat(message.guild.id, message.author.id, "dark_market", 1, True)
-                await interaction.response.send_message("is someone watching after you?", ephemeral=True)
-                await asyncio.sleep(5)
-                await interaction.followup.send("you walk up to them. the dark voice says:", ephemeral=True)
-                await asyncio.sleep(5)
-                await interaction.followup.send("**???**: Hello. We have a unique deal for you.", ephemeral=True)
-                await asyncio.sleep(5)
-                await interaction.followup.send("**???**: To access our services, press \"Hidden\" `/achievements` tab 3 times in a row.", ephemeral=True)
-                await asyncio.sleep(5)
-                await interaction.followup.send("**???**: You won't be disappointed.", ephemeral=True)
-                await asyncio.sleep(5)
-                await interaction.followup.send("before you manage to process that, the figure disappears. will you figure out whats going on?", ephemeral=True)
-                await asyncio.sleep(5)
-                await interaction.followup.send("the only choice is to go to that place.", ephemeral=True)
-            
-            if randint(0, 50) == 0:
-                button = Button(label="Join our Discord!", url="https://discord.gg/staring")
-            elif randint(0, 6) == 0 and WEBHOOK_VERIFY and get_cat(0, message.author.id, "vote_time_topgg") + 43200 < time.time():
-                button = Button(emoji=get_emoji("topgg"), label="Vote for free cats", url=f"https://top.gg/bot/966695034340663367/vote?channel_id={message.channel.id}")
-            elif randint(0, 10) == 0 and get_cat(message.guild.id, message.author.id, "Fine") >= 20 and get_cat(message.guild.id, message.author.id, "dark_market") == 0:
-                button = Button(label="You see a shadow...", style=ButtonStyle.blurple)
-                button.callback = dark_market_cutscene
-            
-            if button:
-                view = View(timeout=3600)
-                view.add_item(button)
-            
-            await message.channel.send(coughstring.format(username=message.author.name.replace("_", "\_"),
-                                                           emoji=icon,
-                                                           type=le_emoji,
-                                                           count=add_cat(message.guild.id, message.author.id, le_emoji, silly_amount),
-                                                           time=caught_time[:-1]) + suffix_string,
-                                       view=view,
-                                       allowed_mentions=None)
-            
-            # handle fastest and slowest catches
-            if do_time and time_caught < get_time(message.guild.id, message.author.id):
-                set_time(message.guild.id, message.author.id, time_caught)
-            if do_time and time_caught > get_time(message.guild.id, message.author.id, "slow"):
-                set_time(message.guild.id, message.author.id, time_caught, "slow")
-
-            await achemb(message, "first", "send")
-            
-            if do_time and get_time(message.guild.id, message.author.id) <= 5: await achemb(message, "fast_catcher", "send")
-
-            if do_time and get_time(message.guild.id, message.author.id, "slow") >= 3600: await achemb(message, "slow_catcher", "send")
-
-            if do_time and time_caught == 3.14: await achemb(message, "pie", "send")
-
-            # handle battlepass
-            async def do_reward(message, level):
-                db[str(message.guild.id)][str(message.author.id)]["progress"] = 0
-                reward = level["reward"]
-                reward_amount = level["reward_amount"]
-                add_cat(message.guild.id, message.author.id, reward, reward_amount)
-                icon = get_emoji(reward.lower() + "cat")
-                new = add_cat(message.guild.id, message.author.id, "battlepass")
-                embed = discord.Embed(title=f"Level {new} complete!", description=f"You have recieved {icon} {reward_amount} {reward} cats!", color=0x007F0E).set_author(name="Cattlepass level!", icon_url="https://pomf2.lain.la/f/zncxu6ej.png")
-                await message.channel.send(embed=embed)
-
-            if not get_cat(message.guild.id, message.author.id, "battlepass"):
-                db[str(message.guild.id)][str(message.author.id)]["battlepass"] = 0
-            if not get_cat(message.guild.id, message.author.id, "progress"):
-                db[str(message.guild.id)][str(message.author.id)]["progress"] = 0
-
-            battlelevel = battle["levels"][get_cat(message.guild.id, message.author.id, "battlepass")]
-            if battlelevel["req"] == "catch_fast" and do_time and time_caught < battlelevel["req_data"]:
-                await do_reward(message, battlelevel)
-            if battlelevel["req"] == "catch":
-                add_cat(message.guild.id, message.author.id, "progress")
-                if get_cat(message.guild.id, message.author.id, "progress") == battlelevel["req_data"]:
+                if randint(0, 50) == 0:
+                    button = Button(label="Join our Discord!", url="https://discord.gg/staring")
+                elif randint(0, 6) == 0 and WEBHOOK_VERIFY and get_cat(0, message.author.id, "vote_time_topgg") + 43200 < time.time():
+                    button_texts = [
+                        "If vote cat will you friend :)",
+                        "Vote cat for president",
+                        "vote = 0.01% to escape basement",
+                        "vote vote vote vote vote",
+                        "mrrp mrrow go and vote now",
+                        "if you vote you'll be free (no)",
+                        "Like gambling? Vote!",
+                        "vote. btw, i have a pipebomb",
+                        "No votes? :megamind:",
+                        "Cat says you should vote",
+                        "vote = random cats. lets gamble?",
+                        "cat will be happy if you vote",
+                        "VOTE NOW!!",
+                        "Vote on top.gg for free cats",
+                        "Vote for free cats",
+                        "No vote = no free cats :(",
+                        "0.04% to get egirl on voting",
+                        "I voted and got 1000000$",
+                        "I voted and found a gf",
+                        "lebron james forgot to vote",
+                        "vote if you like cats",
+                        "vote if cats > dogs",
+                        "you should vote for cat NOW!"
+                    ]
+                    button = Button(emoji=get_emoji("topgg"), label=choice(button_texts), url="https://top.gg/bot/966695034340663367/vote")
+                elif randint(0, 10) == 0 and get_cat(message.guild.id, message.author.id, "Fine") >= 20 and get_cat(message.guild.id, message.author.id, "dark_market") == 0:
+                    button = Button(label="You see a shadow...", style=ButtonStyle.blurple)
+                    button.callback = dark_market_cutscene
+                
+                if button:
+                    view = View(timeout=3600)
+                    view.add_item(button)
+                
+                await message.channel.send(coughstring.replace("{username}", message.author.name.replace("_", "\_"))
+                                                      .replace("{emoji}", str(icon))
+                                                      .replace("{type}", le_emoji)
+                                                      .replace("{count}", str(add_cat(message.guild.id, message.author.id, le_emoji, silly_amount)))
+                                                      .replace("{time}", caught_time[:-1]) + suffix_string,
+                                           view=view,
+                                           allowed_mentions=None)
+                
+                # handle fastest and slowest catches
+                if do_time and time_caught < get_time(message.guild.id, message.author.id):
+                    set_time(message.guild.id, message.author.id, time_caught)
+                if do_time and time_caught > get_time(message.guild.id, message.author.id, "slow"):
+                    set_time(message.guild.id, message.author.id, time_caught, "slow")
+    
+                await achemb(message, "first", "send")
+                
+                if do_time and get_time(message.guild.id, message.author.id) <= 5: await achemb(message, "fast_catcher", "send")
+    
+                if do_time and get_time(message.guild.id, message.author.id, "slow") >= 3600: await achemb(message, "slow_catcher", "send")
+    
+                if do_time and time_caught == 3.14: await achemb(message, "pie", "send")
+    
+                # handle battlepass
+                async def do_reward(message, level):
+                    db[str(message.guild.id)][str(message.author.id)]["progress"] = 0
+                    reward = level["reward"]
+                    reward_amount = level["reward_amount"]
+                    add_cat(message.guild.id, message.author.id, reward, reward_amount)
+                    icon = get_emoji(reward.lower() + "cat")
+                    new = add_cat(message.guild.id, message.author.id, "battlepass")
+                    embed = discord.Embed(title=f"Level {new} complete!", description=f"You have recieved {icon} {reward_amount} {reward} cats!", color=0x007F0E).set_author(name="Cattlepass level!", icon_url="https://pomf2.lain.la/f/zncxu6ej.png")
+                    await message.channel.send(embed=embed)
+    
+                if not get_cat(message.guild.id, message.author.id, "battlepass"):
+                    db[str(message.guild.id)][str(message.author.id)]["battlepass"] = 0
+                if not get_cat(message.guild.id, message.author.id, "progress"):
+                    db[str(message.guild.id)][str(message.author.id)]["progress"] = 0
+    
+                battlelevel = battle["levels"][get_cat(message.guild.id, message.author.id, "battlepass")]
+                if battlelevel["req"] == "catch_fast" and do_time and time_caught < battlelevel["req_data"]:
                     await do_reward(message, battlelevel)
-            if battlelevel["req"] == "catch_type" and le_emoji == battlelevel["req_data"]:
-                await do_reward(message, battlelevel)
+                if battlelevel["req"] == "catch":
+                    add_cat(message.guild.id, message.author.id, "progress")
+                    if get_cat(message.guild.id, message.author.id, "progress") == battlelevel["req_data"]:
+                        await do_reward(message, battlelevel)
+                if battlelevel["req"] == "catch_type" and le_emoji == battlelevel["req_data"]:
+                    await do_reward(message, battlelevel)
+            except Exception:
+                raise
+            finally:
+                await asyncio.sleep(decided_time)
+                await spawn_cat(str(message.channel.id))
 
     # those are "owner" commands which are not really interesting
     if text.lower().startswith("cat!beggar") and message.author.id == OWNER_ID:
@@ -896,13 +933,15 @@ async def on_message(message):
         abc.append(int(message.channel.id))
         db["summon_ids"] = abc
         db["cat"][str(message.channel.id)] = False
-        fire[str(message.channel.id)] = True
         save("summon_ids")
         save("cat")
         await message.reply(f"ok, now i will also send cats in <#{message.channel.id}>")
     if text.lower().startswith("cat!print") and message.author.id == OWNER_ID:
         # just a simple one-line with no async (e.g. 2+3)
-        await message.reply(eval(text[9:]))
+        try:
+            await message.reply(eval(text[9:]))
+        except Exception:
+            await message.reply(traceback.format_exc())
     if text.lower().startswith("cat!eval") and message.author.id == OWNER_ID:
         # complex eval, multi-line + async support
         # requires the full `await message.channel.send(2+3)` to get the result
@@ -923,7 +962,10 @@ async def on_message(message):
 
         complete = intro + spaced + ending
         print(complete)
-        exec(complete)
+        try:
+            exec(complete)
+        except Exception:
+            await message.reply(traceback.format_exc())
     if text.lower().startswith("cat!news") and message.author.id == OWNER_ID:
         for i in db["summon_ids"]:
             try:
@@ -953,15 +995,6 @@ async def on_message(message):
         save("0")
         await message.reply("success")
 
-    try:
-        catchmsg = await message.channel.fetch_message(db["cat"][str(message.channel.id)])
-        if get_emoji("suscat") in catchmsg.content:
-            for i in ["sus", "amogus", "among", "vent", "report"]:
-                if i in text.lower():
-                    await achemb(message, "sussy", "send")
-                    break
-    except Exception:
-        pass
 
 
 # the message when cat gets added to a new server
@@ -979,11 +1012,9 @@ async def on_guild_join(guild):
     ch = find("cat", guild.text_channels)
     if not verify(ch): ch = find("bots", guild.text_channels)
     if not verify(ch):
-        chindex = 1
-        ch = guild.text_channels[0]
-        while not verify(ch):
-            ch = guild.text_channels[chindex]
-            chindex += 1
+        for ch in guild.text_channels:
+            if verify(ch):
+                break
     
     # you are free to change/remove this, its just a note for general user letting them know
     unofficial_note = "**NOTE: This is an unofficial Cat Bot instance.**\n\n"
@@ -1076,7 +1107,7 @@ async def tiktok(message: discord.Interaction, text: str):
 @bot.tree.command(description="(ADMIN) Prevent someone from catching cats for a certain time period")
 @discord.app_commands.default_permissions(manage_guild=True)
 @discord.app_commands.describe(person="A person to timeout!", timeout="How many seconds? (0 to reset)")
-async def preventcatch(message: discord.Interaction, person: discord.Member, timeout: int):
+async def preventcatch(message: discord.Interaction, person: discord.User, timeout: int):
     if timeout < 0:
         await message.response.send_message("uhh i think time is supposed to be a number", ephemeral=True)
         return
@@ -1105,48 +1136,29 @@ async def repair(message: discord.Interaction):
 @discord.app_commands.describe(minimum_time="In seconds, minimum possible time between spawns (leave both empty to reset)",
                                maximum_time="In seconds, maximum possible time between spawns (leave both empty to reset)")
 async def changetimings(message: discord.Interaction, minimum_time: Optional[int], maximum_time: Optional[int]):
-    global terminate_queue, update_queue
-    # terminate and update queues indicate the loops to do stuff when they are done with waiting
-
     if int(message.channel.id) not in db["summon_ids"]:
         await message.response.send_message("This channel isnt setupped. Please select a valid channel.", ephemeral=True)
         return
 
     if not minimum_time and not maximum_time:
         # reset
-        if str(message.channel.id) in terminate_queue:
-            await message.response.send_message("You already reset the timings here recently. To prevent weird behaviour, please wait before doing this again.")
-            return
-        terminate_queue.append(str(message.channel.id))
         try:
             del db["spawn_times"][str(message.channel.id)]
-            del db["recovery_times"][str(message.channel.id)]
         except:
             await message.response.send_message("This channel already has default spawning intervals.")
             return
         save("spawn_times")
-        save("recovery_times")
         await message.response.send_message("Success! This channel is now reset back to usual spawning intervals.")
     elif minimum_time and maximum_time:
         if minimum_time < 20:
             await message.response.send_message("Sorry, but minimum time must be above 20 seconds.", ephemeral=True)
             return
-        if maximum_time <= minimum_time:
+        if maximum_time < minimum_time:
             await message.response.send_message("Sorry, but minimum time must be less than maximum time.", ephemeral=True)
             return
 
-        # create a custom loop if it wasnt already created
-        if str(message.channel.id) not in db["spawn_times"].keys():
-            do_spawn = True
-        else:
-            do_spawn = False
-            update_queue.append(str(message.channel.id))
-
         db["spawn_times"][str(message.channel.id)] = [minimum_time, maximum_time]
         save("spawn_times")
-
-        if do_spawn:
-            bot.loop.create_task(spawning_loop([minimum_time, maximum_time], message.channel.id))
 
         await message.response.send_message(f"Success! The next spawn will be {minimum_time} to {maximum_time} seconds from now.")
     else:
@@ -1191,9 +1203,9 @@ async def changemessage(message: discord.Interaction):
                     if i not in input_value:
                         await interaction.response.send_message(f"nuh uh! you are missing `{i}`.", ephemeral=True)
                         return
-                icon = get_emoji("staring_cat")
+                icon = get_emoji("fine_cat")
                 await interaction.response.send_message("Success! Here is a preview:\n" + \
-                                                    input_value.format(emoji=icon, type="Example", username="Cat Bot", count="1", time="69 years 420 days"))
+                    input_value.replace("{emoji}", str(icon)).replace("{type}", "Fine").replace("{username}", "Cat Bot").replace("{count}", "1").replace("{time}", "69 years 420 days"))
             else:
                 await interaction.response.send_message("Reset to defaults.")
             db[str(message.guild.id)][self.type.lower()] = input_value
@@ -1272,22 +1284,24 @@ async def last(message: discord.Interaction):
         displayedtime = "forever ago"
     await message.response.send_message(f"the last cat in this channel was caught {displayedtime}.")
 
-@bot.tree.command(description="View your inventory")
-@discord.app_commands.rename(person_id='user')
-@discord.app_commands.describe(person_id="Person to view the inventory of!")
-async def inventory(message: discord.Interaction, person_id: Optional[discord.Member]):
-    # UGGHHH GOOD LUCK
 
+async def gen_inventory(message, person_id):
     # check if we are viewing our own inv or some other person
     if person_id is None:
         me = True
         person_id = message.user
     else:
         me = False
-    await message.response.defer()
 
     register_member(message.guild.id, person_id.id)
     has_ach(message.guild.id, person_id.id, "test_ach") # why is this here? im not sure and im too scared to remove this
+
+    if not get_cat("0", person_id.id, "emoji"):
+        set_cat("0", person_id.id, "emoji", "")
+    if not get_cat("0", person_id.id, "color"):
+        set_cat("0", person_id.id, "color", "#6E593C")
+    if not get_cat("0", person_id.id, "image"):
+        set_cat("0", person_id.id, "image", None)
 
     # around here we count aches
     db_var = db[str(message.guild.id)][str(person_id.id)]["ach"]
@@ -1338,8 +1352,15 @@ async def inventory(message: discord.Interaction, person_id: Optional[discord.Me
     else:
         your = person_id.name + "'s"
 
+    if get_cat("0", person_id.id, "emoji"):
+        emoji_prefix = get_cat("0", person_id.id, "emoji") + " "
+    else:
+        emoji_prefix = ""
+
     embedVar = discord.Embed(
-            title=your + " cats:", description=f"{your} fastest catch is: {catch_time} s\nand {your} slowest catch is: {slow_time} h\nAchievements unlocked: {unlocked}/{total_achs}{minus_achs}", color=0x6E593C
+        title=f"{emoji_prefix}{your} cats:",
+        description=f"{your} fastest catch is: {catch_time} s\nand {your} slowest catch is: {slow_time} h\nAchievements unlocked: {unlocked}/{total_achs}{minus_achs}",
+        color=discord.Colour.from_str(get_cat("0", person_id.id, "color"))
     )
     
     give_collector = True
@@ -1391,15 +1412,60 @@ async def inventory(message: discord.Interaction, person_id: Optional[discord.Me
     
     if do_save:
         save(message.guild.id)
+
+    embedVar.description += f"\nTotal cats: {total}"
     
-    embedVar.set_footer(text=f"Total cats: {total}")
-    await message.followup.send(embed=embedVar)
-    
+    if get_cat("0", person_id.id, "image"):
+        embedVar.set_thumbnail(url=get_cat("0", person_id.id, "image"))
+
     if me:
         # give some aches if we are vieweing our own inventory
         if give_collector: await achemb(message, "collecter", "send")
         if get_time(message.guild.id, message.user.id) <= 5: await achemb(message, "fast_catcher", "send")
         if get_time(message.guild.id, message.user.id, "slow") >= 3600: await achemb(message, "slow_catcher", "send")
+
+    return embedVar
+    
+@bot.tree.command(description="View your inventory")
+@discord.app_commands.rename(person_id='user')
+@discord.app_commands.describe(person_id="Person to view the inventory of!")
+async def inventory(message: discord.Interaction, person_id: Optional[discord.User]):
+    await message.response.defer()
+    
+    embedVar = await gen_inventory(message, person_id)
+    
+    if DONOR_CHANNEL_ID:
+        embedVar.set_footer(text="Make this pretty with /editprofile")
+    
+    await message.followup.send(embed=embedVar)
+
+
+@bot.tree.command(description="Support Cat Bot!")
+async def donate(message: discord.Interaction):
+    thing = discord.File("supporter.png", filename="supporter.png")
+    await message.response.send_message("👑 For as little as $3 you can support Cat Bot and unlock profile customization!\n<https://catbot.minkos.lol/donate>", file=thing)
+
+@bot.tree.command(description="[SUPPORTER] Customize your profile!")
+@discord.app_commands.rename(provided_emoji='emoji')
+@discord.app_commands.describe(color="Color for your profile in hex form (e.g. #6E593C)",
+                               provided_emoji="A default Discord emoji to show near your username.",
+                               image="A square image to show in top-right corner of your profile.")
+async def editprofile(message: discord.Interaction, color: Optional[str], provided_emoji: Optional[str], image: Optional[discord.Attachment]):
+    if not get_cat("0", message.user.id, "premium"):
+        await message.response.send_message("👑 This feature is supporter-only!\nFor as little as $3 you can support Cat Bot and unlock profile customization!\n<https://catbot.minkos.lol/donate>")
+        return
+    
+    if provided_emoji and discord_emoji.to_discord(provided_emoji.strip()):
+        set_cat("0", message.user.id, "emoji", provided_emoji.strip())
+        
+    if color:
+        match = re.search(r'^#(?:[0-9a-fA-F]{3}){1,2}$', color)
+        if match: set_cat("0", message.user.id, "color", match.group(0))
+    if image:
+        set_cat("0", message.user.id, "image", image.url)
+    embedVar = await gen_inventory(message, message.user)
+    await message.response.send_message("Success! Here is a preview:", embed=embedVar)
+
 
 @bot.tree.command(description="I like fortnite")
 async def battlepass(message: discord.Interaction):
@@ -1463,10 +1529,15 @@ async def ping(message: discord.Interaction):
 
 @bot.tree.command(description="give cats now")
 @discord.app_commands.rename(cat_type="type")
-@discord.app_commands.describe(person="Whom to donate?", cat_type="Select a donate cat type", amount="And how much?")
-async def gift(message: discord.Interaction, person: discord.Member, cat_type: Literal[tuple(cattypes)], amount: Optional[int]):
+@discord.app_commands.describe(person="Whom to donate?", cat_type="Select a fucking cat type", amount="And how much?")
+@discord.app_commands.autocomplete(cat_type=cat_type_autocomplete)
+async def gift(message: discord.Interaction, person: discord.User, cat_type: str, amount: Optional[int]):
     if not amount: amount = 1  # default the amount to 1
     person_id = person.id
+
+    if cat_type not in cattypes:
+        await message.response.send_message("bro what", ephemeral=True)
+        return
 
     # if we even have enough cats
     if get_cat(message.guild.id, message.user.id, cat_type) >= amount and amount > 0 and message.user.id != person_id:
@@ -1520,7 +1591,7 @@ async def gift(message: discord.Interaction, person: discord.Member, cat_type: L
 @bot.tree.command(description="Trade cats!")
 @discord.app_commands.rename(person_id="user")
 @discord.app_commands.describe(person_id="why would you need description")
-async def trade(message: discord.Interaction, person_id: discord.Member):
+async def trade(message: discord.Interaction, person_id: discord.User):
     person1 = message.user
     person2 = person_id
         
@@ -1645,8 +1716,7 @@ async def trade(message: discord.Interaction, person_id: discord.Member):
         view.add_item(deny)
         view.add_item(add)
 
-        coolembed = discord.Embed(color=0x6E593C, title=f"{person1.name} and {person2.name} trade", description="no way")
-
+        coolembed = discord.Embed(color=0x6E593C, title=f"{person1.name.replace("_", r"\_")} and {person2.name.replace("_", r"\_")} trade", description="no way")
         # a single field for one person
         def field(personaccept, persongives, person):
             nonlocal coolembed
@@ -1840,6 +1910,7 @@ async def casino(message: discord.Interaction):
     await message.response.send_message(embed=embed, view=myview)
 
 async def toggle_reminders(interaction):
+    vote_remind = db["vote_remind"]
     if interaction.user.id in vote_remind:
         vote_remind.remove(interaction.user.id)
         await interaction.response.send_message("Vote reminders have been turned off.", ephemeral=True)
@@ -1860,7 +1931,8 @@ if WEBHOOK_VERIFY:
         
         current_day = datetime.datetime.utcnow().isoweekday()
 
-        add_cat(0, message.user.id, "vote_channel", message.channel.id, True)
+        if message.guild != None:
+            add_cat(0, message.user.id, "vote_channel", message.channel.id, True)
 
         if current_day == 6 or current_day == 7:
             weekend_message = "🌟 **It's weekend! All vote rewards are DOUBLED!**\n\n"
@@ -1877,13 +1949,13 @@ if WEBHOOK_VERIFY:
             left = int(get_cat(0, message.user.id, "vote_time_topgg") + 43200 - time.time()) // 60
             button = Button(emoji=get_emoji("topgg"), label=f"{str(left//60).zfill(2)}:{str(left%60).zfill(2)}", style=ButtonStyle.gray, disabled=True)
         else:
-            button = Button(emoji=get_emoji("topgg"), label="Vote", style=ButtonStyle.gray, url=f"https://top.gg/bot/966695034340663367/vote?channel_id={message.channel.id}")
+            button = Button(emoji=get_emoji("topgg"), label="Vote", style=ButtonStyle.gray, url="https://top.gg/bot/966695034340663367/vote")
         view.add_item(button)
 
         if message.user.id in vote_remind:
             button = Button(label="Disable reminders", style=ButtonStyle.gray)
         else:
-            button = Button(label="Enable Vote Reminders!", style=ButtonStyle.green)
+            button = Button(label="Enable Reminders!", style=ButtonStyle.green)
         button.callback = toggle_reminders
         view.add_item(button)
         
@@ -1901,6 +1973,31 @@ async def random(message: discord.Interaction):
                 await achemb(message, "randomizer", "send")
         except Exception:
             await message.followup.send("no cats :(")
+
+@bot.tree.command(name="fact", description="get a random cat fact")
+async def cat_fact(message: discord.Interaction):
+    facts = [
+        "you love cats",
+        f"cat bot is in {len(bot.guilds):,} servers",
+        "chocolate is bad for cats",
+        "cat",
+        "cats land on their feet",
+        "cats bring you mice/birds as a gift",
+        "cats are the best"
+    ]
+
+    # give a fact from the list or the API
+    if randint(0, 1) == 0:
+        await message.response.send_message(choice(facts))
+    else:
+        await message.response.defer()
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://catfact.ninja/fact", timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    await message.followup.send(data["fact"])
+                else:
+                    await message.followup.send("failed to fetch a cat fact.")
 
 async def light_market(message):
     cataine_prices = [[10, "Fine"], [30, "Fine"], [20, "Good"], [15, "Rare"], [20, "Wild"], [10, "Epic"], [20, "Sus"], [15, "Rickroll"],
@@ -1928,6 +2025,7 @@ async def light_market(message):
         else:
             embed = discord.Embed(title="The Mafia Hideout", description=f"you have used up all of your cataine for the week. please come back later.")
             await message.followup.send(embed=embed, ephemeral=True)
+            return
         type = deal[1]
         amount = deal[0]
         embed.add_field(name="🧂 12h of Cataine", value=f"Price: {get_emoji(type.lower() + 'cat')} {amount} {type}")
@@ -2011,7 +2109,7 @@ async def dark_market(message):
                 counter += 1
                 await interaction2.response.defer()
                 if counter == 30:
-                    await interaction2.edit_original_message(view=None)
+                    await interaction2.edit_original_response(view=None)
                     await asyncio.sleep(5)
                     await interaction2.followup.send("You barely manage to turn around a corner and hide to run away.", ephemeral=True)
                     await asyncio.sleep(5)
@@ -2384,7 +2482,12 @@ async def leaderboards(message: discord.Interaction, leaderboard_type: Optional[
 @discord.app_commands.default_permissions(manage_guild=True)
 @discord.app_commands.rename(person_id="user")
 @discord.app_commands.describe(person_id="who", amount="how many", cat_type="what")
-async def givecat(message: discord.Interaction, person_id: discord.Member, amount: int, cat_type: Literal[tuple(cattypes)]):
+@discord.app_commands.autocomplete(cat_type=cat_type_autocomplete)
+async def givecat(message: discord.Interaction, person_id: discord.User, amount: int, cat_type: str):
+    if cat_type not in cattypes:
+        await message.response.send_message("bro what", ephemeral=True)
+        return
+
     add_cat(message.guild.id, person_id.id, cat_type, amount)
     embed = discord.Embed(title="Success!", description=f"gave <@{person_id.id}> {amount} {cat_type} cats", color=0x6E593C)
     await message.response.send_message(embed=embed)
@@ -2406,10 +2509,9 @@ async def setup(message: discord.Interaction):
     except Exception:
          pass
     db["cat"][str(message.channel.id)] = False
-    fire[str(message.channel.id)] = True
     save("summon_ids")
     save("cat")
-    await soft_force(message.channel) # force the first cat spawn incase something isnt working
+    await spawn_cat(str(message.channel.id)) # force the first cat spawn incase something isnt working
     await message.response.send_message(f"ok, now i will also send cats in <#{message.channel.id}>")
 
 @bot.tree.command(description="(ADMIN) Undo the setup")
@@ -2434,33 +2536,16 @@ async def fake(message: discord.Interaction):
     await message.response.send_message("OMG TROLLED SO HARD LMAOOOO 😂", ephemeral=True)
     await achemb(message, "trolled", "followup")
 
-async def soft_force(channeley, cat_type=None):
-    # this is common called between /forcespawn and /setup
-    fire[channeley.id] = False
-    file = discord.File("cat.png", filename="cat.png")
-    if not cat_type:
-        localcat = choice(CAT_TYPES)
-    else:
-        localcat = cat_type
-    icon = get_emoji(localcat.lower() + "cat")
-    try:
-        if db[str(channeley.guild.id)]["appear"]:
-            appearstring = db[str(channeley.guild.id)]["appear"]
-        else:
-            appearstring = "{emoji} {type} cat has appeared! Type \"cat\" to catch it!"
-    except Exception as e:
-        db[str(channeley.guild.id)]["appear"] = ""
-        appearstring = "{emoji} {type} cat has appeared! Type \"cat\" to catch it!"
-    
-    message_is_sus = await channeley.send(appearstring.format(emoji=str(icon), type=localcat), file=file)
-    db["cat"][str(channeley.id)] = message_is_sus.id
-    save("cat")
-
 @bot.tree.command(description="(ADMIN) Force cats to appear")
 @discord.app_commands.default_permissions(manage_guild=True)
 @discord.app_commands.rename(cat_type="type")
 @discord.app_commands.describe(cat_type="select a cat type ok")
-async def forcespawn(message: discord.Interaction, cat_type: Optional[Literal[tuple(cattypes)]]):
+@discord.app_commands.autocomplete(cat_type=cat_type_autocomplete)
+async def forcespawn(message: discord.Interaction, cat_type: Optional[str]):
+    if cat_type and cat_type not in cattypes:
+        await message.response.send_message("bro what", ephemeral=True)
+        return
+
     try:
         if db["cat"][str(message.channel.id)]:
             await message.response.send_message("there is already a cat", ephemeral=True)
@@ -2468,14 +2553,15 @@ async def forcespawn(message: discord.Interaction, cat_type: Optional[Literal[tu
     except Exception:
         await message.response.send_message("this channel is not /setup-ed", ephemeral=True)
         return
-    await soft_force(message.channel, cat_type)
-    await message.response.send_message("done!\n**Note:** you can use `/givecat` to give yourself cats, there is no need to spam this", ephemeral=True)
+    await spawn_cat(str(message.channel.id), cat_type)
+    await message.response.send_message("done!\n**Note:** you can use `/givecat` to give yourself cats, there is no need to spam this")
 
 @bot.tree.command(description="(ADMIN) Give achievements to people")
 @discord.app_commands.default_permissions(manage_guild=True)
 @discord.app_commands.rename(person_id="user", ach_id="name")
 @discord.app_commands.describe(person_id="who", ach_id="name or id of the achievement")
-async def giveachievement(message: discord.Interaction, person_id: discord.Member, ach_id: str):
+@discord.app_commands.autocomplete(ach_id=ach_autocomplete)
+async def giveachievement(message: discord.Interaction, person_id: discord.User, ach_id: str):
     # check if ach is real
     try:
         if ach_id in ach_names:
@@ -2489,7 +2575,7 @@ async def giveachievement(message: discord.Interaction, person_id: discord.Membe
         ach_id = ach_titles[ach_id.lower()]
         valid = True
 
-    if valid and ach_id == "thanksforplaying":
+    if valid and ach_id == "thanksforplaying" and not has_ach(message.guild.id, person_id.id, ach_id):
         await message.response.send_message("HAHAHHAHAH\nno", ephemeral=True)
         return
                       
@@ -2536,7 +2622,7 @@ async def nuke(message: discord.Interaction):
         if interaction.user.id == message.user.id:
             await interaction.response.defer()
             counter -= 1
-            if counter == 0:
+            if counter <= 0:
                 # Scary!
                 db[str(message.guild.id)] = {}
                 save(message.guild.id)
@@ -2552,7 +2638,8 @@ async def nuke(message: discord.Interaction):
     await message.response.send_message(warning_text, view=view)
 
 # this is the crash handler
-@bot.event
+@bot.on_error
+@bot.tree.error
 async def on_command_error(ctx, error):
     def in_error(x):
         return bool(x in str(type(error)) or x in str(error))
@@ -2560,7 +2647,7 @@ async def on_command_error(ctx, error):
     if ctx.guild == None:
         await ctx.channel.send("hello good sir i would politely let you know cat bot is no workey in dms please consider gettng the hell out of here")
         return
-    
+
     # ctx here is interaction
     normal_crash = False
     if in_error("KeyboardInterrupt"): # keyboard interrupt
@@ -2569,7 +2656,7 @@ async def on_command_error(ctx, error):
         # forbidden error usually means we dont have permission to send messages in the channel
         print("logged a Forbidden error.")
         # except-ception lessgo
-        forbidden_error = "i don't have permissions to do that.\ntry reinviting the bot or give it roles needed to access this chat (for example, verified role)"
+        forbidden_error = "i don't have permissions to do that.\ntry reinviting the bot or give it roles needed to access this chat (for example, verified role). more ideally, give it admin/mod."
         try:
             await ctx.channel.send(forbidden_error) # try as normal message (most likely will fail)
         except Exception:
@@ -2580,9 +2667,12 @@ async def on_command_error(ctx, error):
                     await ctx.followup.send(forbidden_error) # or as a followup if it already got responded to
                 except Exception:
                     try:
-                        await ctx.user.send(forbidden_error) # as last resort, dm the runner
+                        await ctx.user.send(forbidden_error) # dm the runner
                     except Exception:
-                        pass # give up
+                        try:
+                            await ctx.guild.owner.send(forbidden_error) # dm the guild owner
+                        except Exception:
+                            pass # give up
     elif in_error("NotFound"):
         # discord just pretends if interaction took more than 3 seconds it never happened and its annoying af
         print("logged a NotFound error.")
@@ -2591,32 +2681,25 @@ async def on_command_error(ctx, error):
         print("not a common error, crash reporting.")
         normal_crash = True
         await ctx.channel.send("cat crashed lmao\ni automatically sent crash reports so yes")
-        # give the ach! (or atleast try)
-        try:
-            await achemb(ctx, "crasher", "send")
-        except Exception:
-            pass
 
-    # try to get some context maybe if we get lucky
-    try:
-        cont = ctx.guild.id
-        print("debug", cont)
-    except Exception as e:
-        cont = "Error getting"
-
-    error2 = error.original.__traceback__
-
-    # if actually interesting crash, dm to bot owner
-    if normal_crash:
-        await milenakoos.send(
-                "There is an error happend:\n"
-                + str("".join(traceback.format_tb(error2))) + str(type(error).__name__) + str(error)
-                + "\n\nMessage guild: "
-                + str(cont)
-        )
-    else:
-        # otherwise log to console
-        print(str("".join(traceback.format_tb(error2))) + str(type(error).__name__) + str(error))
+        if CRASH_MODE == "DM":
+            # try to get some context maybe if we get lucky
+            try:
+                cont = ctx.guild.id
+            except Exception:
+                cont = "Error getting"
+        
+            error2 = error.original.__traceback__
+        
+            # if actually interesting crash, dm to bot owner
+            await milenakoos.send(
+                    "There is an error happend:\n"
+                    + str("".join(traceback.format_tb(error2))) + str(type(error).__name__) + str(error)
+                    + "\n\nMessage guild: "
+                    + str(cont)
+            )
+        elif CRASH_MODE == "RAISE":
+            raise
 
 async def claim_reward(user, channeley, type):
     # who at python hq though this was reasonable syntax
@@ -2674,11 +2757,9 @@ async def recieve_vote(request):
     set_cat(0, user, "reminder_topgg_exists", 0)
     
     try:
-        if "channel_id" in request_json.keys():
-            channel_id = int(request_json["channel_id"])
-        else:
-            channel_id = get_cat("0", user, "vote_channel")
-        channeley = await bot.fetch_channel(channel_id)
+        channeley = await bot.fetch_channel(get_cat("0", user, "vote_channel"))
+        if not channeley.guild:
+            raise Exception
     except Exception:
         pending_votes.append([user, type])
         return web.Response(text="ok", status=200)
@@ -2686,5 +2767,5 @@ async def recieve_vote(request):
     await claim_reward(user, channeley, type)
     return web.Response(text="ok", status=200)
 
-
+    
 bot.run(TOKEN)
